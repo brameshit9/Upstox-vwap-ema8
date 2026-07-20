@@ -122,24 +122,42 @@ def _search_instrument(symbol: str, token: str) -> str | None:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _cached_search(symbol: str, _token: str, cache_bust: str) -> str | None:
-    # `_token` is excluded from Streamlit's cache key (leading underscore);
-    # `cache_bust` (today's date) naturally expires the cache each day since
-    # Upstox tokens/instrument sets refresh daily anyway.
+def _cached_search(symbol: str, _token: str, cache_bust: str):
+    """Returns (instrument_key_or_None, error_message_or_None).
+    `_token` is excluded from Streamlit's cache key (leading underscore);
+    `cache_bust` (today's date) naturally expires the cache each day since
+    Upstox tokens/instrument sets refresh daily anyway."""
     try:
-        return _search_instrument(symbol, _token)
-    except requests.HTTPError:
-        return None
+        key = _search_instrument(symbol, _token)
+        if key:
+            return key, None
+        return None, "no matching NSE equity instrument found"
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        if status == 401:
+            return None, "401 Unauthorized — access token is invalid or expired"
+        return None, f"HTTP {status} error"
+    except requests.RequestException as e:
+        return None, f"network error ({e})"
 
 
-def resolve_instrument_keys(symbols: list[str], token: str) -> dict:
+def resolve_instrument_keys(symbols: list[str], token: str):
+    """Returns (mapping, errors). Fails fast on the first request if it's a
+    401, since that means every subsequent symbol will fail the same way."""
     today = datetime.now().strftime("%Y-%m-%d")
-    mapping = {}
+    mapping, errors = {}, []
+
     for sym in symbols:
-        key = _cached_search(sym, token, today)
+        key, err = _cached_search(sym, token, today)
         if key:
             mapping[sym] = key
-    return mapping
+        elif err:
+            errors.append(f"{sym}: {err}")
+            if "401" in err:
+                # Token is dead for every remaining symbol too — stop burning calls.
+                break
+
+    return mapping, errors
 
 
 # --------------------------------------------------------------------------
@@ -240,7 +258,20 @@ def compute_ema8(daily_df: pd.DataFrame, current_price: float) -> float:
 # --------------------------------------------------------------------------
 
 def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
-    key_map = resolve_instrument_keys(symbols, token)
+    key_map, resolve_errors = resolve_instrument_keys(symbols, token)
+
+    if resolve_errors:
+        auth_failed = any("401" in e for e in resolve_errors)
+        if auth_failed:
+            st.error(
+                "🔒 Upstox rejected the access token (401 Unauthorized). "
+                "Tokens expire daily — generate a fresh one at "
+                "[developer.upstox.com](https://developer.upstox.com/) and paste it in the sidebar."
+            )
+        with st.expander(f"⚠️ {len(resolve_errors)} symbol(s) could not be resolved — click for details"):
+            for e in resolve_errors:
+                st.write("•", e)
+
     rows = []
     progress = st.progress(0.0, text="Screening...")
     n = len(symbols)
@@ -366,14 +397,26 @@ def main():
 
     if "results" not in st.session_state:
         st.session_state["results"] = pd.DataFrame()
+    if "has_run" not in st.session_state:
+        st.session_state["has_run"] = False
 
     if run:
         st.session_state["results"] = screen_stocks(symbols, token)
+        st.session_state["has_run"] = True
 
     df = st.session_state["results"]
 
     if df.empty:
-        st.info("Click **Run Screener** in the sidebar to fetch live data.")
+        if st.session_state["has_run"]:
+            st.warning(
+                "Ran the screener but got **zero usable rows**. Common causes: "
+                "an expired/invalid access token (see any red error above), symbols "
+                "that don't match an NSE trading symbol exactly, or every stock "
+                "currently sitting in the 'mixed' zone (above one indicator, below "
+                "the other) which is hidden by design."
+            )
+        else:
+            st.info("Click **Run Screener** in the sidebar to fetch live data.")
         return
 
     above_df = df[df["Status"] == "ABOVE"].drop(columns=["Status"])
