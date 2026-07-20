@@ -8,13 +8,19 @@ each stock as:
 - 🔴 **BELOW** — current price is below *both* VWAP and EMA8
 - *(anything mixed is hidden, as requested)*
 
+**Market-closed handling:** if the market hasn't traded yet today (before
+9:15 AM IST, weekends, exchange holidays), the app automatically falls back
+to the most recent completed session's candles instead of showing nothing.
+Rows using this fallback are labeled `Last close (<date>)` in the **Session**
+column, and a banner appears above the tables.
+
 Clicking a symbol renders a TradingView-style candlestick chart with VWAP and
 EMA8 plotted on top (via Plotly).
 
 ## 1. Get an Upstox access token
 
 1. Sign up as a developer at https://developer.upstox.com/ and create an app.
-2. Complete the OAuth2 login flow to get a daily `access_token`
+2. Complete the OAuth2 login flow ato get a daily `access_token`
    (Upstox tokens expire every day — you'll need to refresh this each
    trading day, or automate the OAuth dance separately).
 
@@ -74,6 +80,12 @@ GitHub.
 - **EMA period**: `EMA_PERIOD = 8` at the top of `app.py`.
 - **VWAP window**: currently resets each day (standard intraday VWAP) using
   1-minute candles.
+- **Symbol → instrument_key lookup**: uses Upstox's authenticated
+  [Instrument Search API](https://upstox.com/developer/api-documentation/instrument-search)
+  (`GET /v2/instruments/search`) rather than the static instrument CSV
+  files — those are being phased out and have been reported blank for some
+  accounts. Results are cached per symbol for a few hours each day.
+- **Candle data**: uses Upstox's v3 historical/intraday candle endpoints.
 - **Rate limits**: Upstox rate-limits historical/quote endpoints; the
   screener paces requests slightly and shows a progress bar. For 50 symbols
   this typically takes well under a minute.
