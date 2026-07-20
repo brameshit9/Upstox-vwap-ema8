@@ -45,6 +45,12 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    AUTOREFRESH_AVAILABLE = False
+
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
@@ -471,14 +477,48 @@ def main():
         symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
         run = st.button("🔍 Run Screener", type="primary", use_container_width=True)
 
+        st.divider()
+        st.subheader("⏱️ Auto-refresh")
+        if not AUTOREFRESH_AVAILABLE:
+            st.caption(
+                "Add `streamlit-autorefresh` to requirements.txt and redeploy to "
+                "enable this (already included in the project's requirements.txt)."
+            )
+        refresh_labels = {"Off": 0, "Every 1 minute": 60_000, "Every 2 minutes": 120_000, "Every 5 minutes": 300_000}
+        refresh_choice = st.selectbox(
+            "Re-run the screener automatically",
+            list(refresh_labels.keys()),
+            index=0,
+            disabled=not AUTOREFRESH_AVAILABLE,
+        )
+        refresh_ms = refresh_labels[refresh_choice]
+
+    if AUTOREFRESH_AVAILABLE and refresh_ms > 0:
+        st_autorefresh(interval=refresh_ms, key="screener_autorefresh")
+
     if "results" not in st.session_state:
         st.session_state["results"] = pd.DataFrame()
     if "has_run" not in st.session_state:
         st.session_state["has_run"] = False
+    if "last_run_at" not in st.session_state:
+        st.session_state["last_run_at"] = None
 
-    if run:
+    # Run on an explicit button click, OR automatically on every autorefresh
+    # tick (autorefresh triggers a script rerun; we just need to act on it).
+    should_run = run or (refresh_ms > 0)
+
+    if should_run:
         st.session_state["results"] = screen_stocks(symbols, token)
         st.session_state["has_run"] = True
+        st.session_state["last_run_at"] = datetime.now().strftime("%H:%M:%S")
+
+    if refresh_ms > 0:
+        st.sidebar.caption(
+            f"🔄 Auto-refreshing every {refresh_choice.lower().replace('every ', '')}. "
+            f"Last updated: **{st.session_state['last_run_at'] or 'running…'}**"
+        )
+    elif st.session_state["last_run_at"]:
+        st.sidebar.caption(f"Last updated: **{st.session_state['last_run_at']}**")
 
     df = st.session_state["results"]
 
