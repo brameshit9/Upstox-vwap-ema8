@@ -16,7 +16,8 @@ Classification:
               (per your requirement: only pure above-both or pure below-both)
 
 A TradingView-style candlestick chart (Plotly) with VWAP and EMA8 overlaid
-is shown when you click a row / pick a symbol from the dropdown.
+is shown for EVERY matching stock (no dropdown) — you can order the charts
+by signal strength (how far price has moved from VWAP/EMA8) or alphabetically.
 
 Setup
 -----
@@ -44,12 +45,6 @@ import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from urllib.parse import quote
-
-try:
-    from streamlit_autorefresh import st_autorefresh
-    AUTOREFRESH_AVAILABLE = True
-except ImportError:
-    AUTOREFRESH_AVAILABLE = False
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -374,6 +369,10 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
             else:
                 status = "NEUTRAL"  # skipped from display per requirement
 
+            # Signal strength: combined % distance of price from VWAP and EMA8.
+            # Larger value = price has moved further away from both lines.
+            strength = abs((ltp - vwap) / vwap) + abs((ltp - ema8) / ema8)
+
             rows.append({
                 "Symbol": sym,
                 "Instrument Key": instrument_key,
@@ -381,6 +380,7 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
                 "VWAP": round(vwap, 2),
                 "EMA8": round(ema8, 2),
                 "Status": status,
+                "Strength": strength,
                 "Session": "Live" if is_live else f"Last close ({session_date})",
             })
         except requests.HTTPError as e:
@@ -410,11 +410,11 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
 # CHART (TradingView-style candlestick + VWAP + EMA8)
 # --------------------------------------------------------------------------
 
-def render_chart(symbol: str, instrument_key: str, token: str):
+def build_chart(symbol: str, instrument_key: str, token: str):
+    """Fetches price data and returns (figure_or_None, is_live, session_date)."""
     price_df, is_live, session_date = fetch_price_series(instrument_key, token)
     if price_df.empty:
-        st.info("No recent intraday data available for this instrument.")
-        return
+        return None, is_live, session_date
 
     typical_price = (price_df["high"] + price_df["low"] + price_df["close"]) / 3
     cum_pv = (typical_price * price_df["volume"]).cumsum()
@@ -442,13 +442,39 @@ def render_chart(symbol: str, instrument_key: str, token: str):
         template="plotly_dark",
         title=f"{symbol} — 1min candles with VWAP & EMA8 ({session_note})",
         xaxis_rangeslider_visible=False,
-        height=550,
+        height=480,
         margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    st.plotly_chart(fig, use_container_width=True)
-    if not is_live:
-        st.caption(f"⏸️ Market is currently closed — showing the last completed session ({session_date}).")
+    return fig, is_live, session_date
+
+
+def render_all_charts(rows_df: pd.DataFrame, token: str, sort_choice: str):
+    """Renders one chart per row in rows_df (no dropdown), ordered either by
+    signal strength (strongest move away from VWAP/EMA8 first) or alphabetically."""
+    if rows_df.empty:
+        st.caption("No stocks currently meet the above/below criteria.")
+        return
+
+    if sort_choice == "Signal strength":
+        ordered = rows_df.sort_values("Strength", ascending=False)
+    else:
+        ordered = rows_df.sort_values("Symbol")
+
+    for _, row in ordered.iterrows():
+        badge = "🟢" if row["Status"] == "ABOVE" else "🔴"
+        st.markdown(
+            f"#### {badge} {row['Symbol']}  ·  LTP {row['LTP']}  ·  "
+            f"VWAP {row['VWAP']}  ·  EMA8 {row['EMA8']}  ·  {row['Session']}"
+        )
+        fig, is_live, session_date = build_chart(row["Symbol"], row["Instrument Key"], token)
+        if fig is None:
+            st.info(f"No recent intraday data available for {row['Symbol']}.")
+            continue
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_{row['Symbol']}")
+        if not is_live:
+            st.caption(f"⏸️ Market is currently closed — showing the last completed session ({session_date}).")
+        st.divider()
 
 
 # --------------------------------------------------------------------------
@@ -477,48 +503,14 @@ def main():
         symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
         run = st.button("🔍 Run Screener", type="primary", use_container_width=True)
 
-        st.divider()
-        st.subheader("⏱️ Auto-refresh")
-        if not AUTOREFRESH_AVAILABLE:
-            st.caption(
-                "Add `streamlit-autorefresh` to requirements.txt and redeploy to "
-                "enable this (already included in the project's requirements.txt)."
-            )
-        refresh_labels = {"Off": 0, "Every 1 minute": 60_000, "Every 2 minutes": 120_000, "Every 5 minutes": 300_000}
-        refresh_choice = st.selectbox(
-            "Re-run the screener automatically",
-            list(refresh_labels.keys()),
-            index=0,
-            disabled=not AUTOREFRESH_AVAILABLE,
-        )
-        refresh_ms = refresh_labels[refresh_choice]
-
-    if AUTOREFRESH_AVAILABLE and refresh_ms > 0:
-        st_autorefresh(interval=refresh_ms, key="screener_autorefresh")
-
     if "results" not in st.session_state:
         st.session_state["results"] = pd.DataFrame()
     if "has_run" not in st.session_state:
         st.session_state["has_run"] = False
-    if "last_run_at" not in st.session_state:
-        st.session_state["last_run_at"] = None
 
-    # Run on an explicit button click, OR automatically on every autorefresh
-    # tick (autorefresh triggers a script rerun; we just need to act on it).
-    should_run = run or (refresh_ms > 0)
-
-    if should_run:
+    if run:
         st.session_state["results"] = screen_stocks(symbols, token)
         st.session_state["has_run"] = True
-        st.session_state["last_run_at"] = datetime.now().strftime("%H:%M:%S")
-
-    if refresh_ms > 0:
-        st.sidebar.caption(
-            f"🔄 Auto-refreshing every {refresh_choice.lower().replace('every ', '')}. "
-            f"Last updated: **{st.session_state['last_run_at'] or 'running…'}**"
-        )
-    elif st.session_state["last_run_at"]:
-        st.sidebar.caption(f"Last updated: **{st.session_state['last_run_at']}**")
 
     df = st.session_state["results"]
 
@@ -547,20 +539,25 @@ def main():
     col1, col2 = st.columns(2)
     with col1:
         st.subheader(f"🟢 Price ABOVE VWAP & EMA8 ({len(above_df)})")
-        st.dataframe(above_df.drop(columns=["Instrument Key"]), use_container_width=True, hide_index=True)
+        st.dataframe(
+            above_df.drop(columns=["Instrument Key", "Strength"]),
+            use_container_width=True, hide_index=True,
+        )
     with col2:
         st.subheader(f"🔴 Price BELOW VWAP & EMA8 ({len(below_df)})")
-        st.dataframe(below_df.drop(columns=["Instrument Key"]), use_container_width=True, hide_index=True)
+        st.dataframe(
+            below_df.drop(columns=["Instrument Key", "Strength"]),
+            use_container_width=True, hide_index=True,
+        )
 
+    # ---- Charts, one per stock (no dropdown) ----
     st.divider()
-    st.subheader("📊 Chart")
-    chart_candidates = pd.concat([above_df, below_df])["Symbol"].tolist()
-    if chart_candidates:
-        picked = st.selectbox("Pick a symbol to view chart", chart_candidates)
-        row = df[df["Symbol"] == picked].iloc[0]
-        render_chart(picked, row["Instrument Key"], token)
-    else:
-        st.caption("No stocks currently meet the above/below criteria.")
+    st.subheader("📊 Charts")
+    valid = pd.concat([above_df, below_df], ignore_index=True)
+    valid = valid.merge(df[["Symbol", "Status"]], on="Symbol", how="left")
+
+    sort_choice = st.radio("Chart order", ["Signal strength", "Alphabetical"], horizontal=True)
+    render_all_charts(valid, token, sort_choice)
 
 
 if __name__ == "__main__":
