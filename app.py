@@ -157,13 +157,46 @@ def _candles_to_df(candles: list) -> pd.DataFrame:
 
 
 def fetch_intraday_1min(instrument_key: str, token: str) -> pd.DataFrame:
-    """Today's 1-minute candles, used to compute running VWAP."""
+    """Today's 1-minute candles, used to compute running VWAP.
+    Empty (zero rows) whenever the market hasn't traded yet today —
+    e.g. before 9:15 AM IST, on a weekend, or on an exchange holiday."""
     key = quote(instrument_key, safe="")
     url = f"{UPSTOX_V3}/historical-candle/intraday/{key}/minutes/1"
     r = requests.get(url, headers=auth_headers(token), timeout=15)
     r.raise_for_status()
     candles = r.json().get("data", {}).get("candles", [])
     return _candles_to_df(candles)
+
+
+def fetch_last_session_1min(instrument_key: str, token: str, lookback_days: int = 7):
+    """Fallback for when the market is closed: pulls 1-minute candles for the
+    last several calendar days and returns only the most recent trading
+    session found (handles weekends/holidays automatically).
+    Returns (dataframe, session_date) — dataframe is empty if nothing found."""
+    key = quote(instrument_key, safe="")
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    url = f"{UPSTOX_V3}/historical-candle/{key}/minutes/1/{to_date}/{from_date}"
+    r = requests.get(url, headers=auth_headers(token), timeout=15)
+    r.raise_for_status()
+    candles = r.json().get("data", {}).get("candles", [])
+    df = _candles_to_df(candles)
+    if df.empty:
+        return df, None
+    last_session_date = df["timestamp"].dt.date.max()
+    session_df = df[df["timestamp"].dt.date == last_session_date].reset_index(drop=True)
+    return session_df, last_session_date
+
+
+def fetch_price_series(instrument_key: str, token: str):
+    """Returns (dataframe, is_live, session_date) — tries today's live
+    intraday candles first, and falls back to the last completed session
+    (previous trading day) if the market is currently closed."""
+    live_df = fetch_intraday_1min(instrument_key, token)
+    if not live_df.empty:
+        return live_df, True, datetime.now().date()
+    fallback_df, session_date = fetch_last_session_1min(instrument_key, token)
+    return fallback_df, False, session_date
 
 
 def fetch_daily_candles(instrument_key: str, token: str, lookback_days: int = 40) -> pd.DataFrame:
@@ -218,14 +251,14 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
             progress.progress((i + 1) / n)
             continue
         try:
-            intraday = fetch_intraday_1min(instrument_key, token)
+            price_df, is_live, session_date = fetch_price_series(instrument_key, token)
             daily = fetch_daily_candles(instrument_key, token)
-            if intraday.empty:
+            if price_df.empty:
                 progress.progress((i + 1) / n)
                 continue
 
-            ltp = float(intraday["close"].iloc[-1])
-            vwap = compute_vwap(intraday)
+            ltp = float(price_df["close"].iloc[-1])
+            vwap = compute_vwap(price_df)
             ema8 = compute_ema8(daily, ltp)
 
             if np.isnan(vwap) or np.isnan(ema8):
@@ -246,6 +279,7 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
                 "VWAP": round(vwap, 2),
                 "EMA8": round(ema8, 2),
                 "Status": status,
+                "Session": "Live" if is_live else f"Last close ({session_date})",
             })
         except requests.HTTPError as e:
             st.warning(f"{sym}: API error ({e})")
@@ -264,41 +298,44 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def render_chart(symbol: str, instrument_key: str, token: str):
-    intraday = fetch_intraday_1min(instrument_key, token)
-    if intraday.empty:
-        st.info("No intraday data available for chart.")
+    price_df, is_live, session_date = fetch_price_series(instrument_key, token)
+    if price_df.empty:
+        st.info("No recent intraday data available for this instrument.")
         return
 
-    typical_price = (intraday["high"] + intraday["low"] + intraday["close"]) / 3
-    cum_pv = (typical_price * intraday["volume"]).cumsum()
-    cum_vol = intraday["volume"].cumsum()
-    intraday["vwap"] = cum_pv / cum_vol.replace(0, np.nan)
-    intraday["ema8"] = intraday["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    typical_price = (price_df["high"] + price_df["low"] + price_df["close"]) / 3
+    cum_pv = (typical_price * price_df["volume"]).cumsum()
+    cum_vol = price_df["volume"].cumsum()
+    price_df["vwap"] = cum_pv / cum_vol.replace(0, np.nan)
+    price_df["ema8"] = price_df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=intraday["timestamp"], open=intraday["open"], high=intraday["high"],
-        low=intraday["low"], close=intraday["close"], name=symbol,
+        x=price_df["timestamp"], open=price_df["open"], high=price_df["high"],
+        low=price_df["low"], close=price_df["close"], name=symbol,
         increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ))
     fig.add_trace(go.Scatter(
-        x=intraday["timestamp"], y=intraday["vwap"], name="VWAP",
+        x=price_df["timestamp"], y=price_df["vwap"], name="VWAP",
         line=dict(color="#ff9800", width=1.6),
     ))
     fig.add_trace(go.Scatter(
-        x=intraday["timestamp"], y=intraday["ema8"], name="EMA8",
+        x=price_df["timestamp"], y=price_df["ema8"], name="EMA8",
         line=dict(color="#2962ff", width=1.6),
     ))
 
+    session_note = "live, today" if is_live else f"last completed session, {session_date}"
     fig.update_layout(
         template="plotly_dark",
-        title=f"{symbol} — 1min candles with VWAP & EMA8",
+        title=f"{symbol} — 1min candles with VWAP & EMA8 ({session_note})",
         xaxis_rangeslider_visible=False,
         height=550,
         margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
+    if not is_live:
+        st.caption(f"⏸️ Market is currently closed — showing the last completed session ({session_date}).")
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +378,12 @@ def main():
 
     above_df = df[df["Status"] == "ABOVE"].drop(columns=["Status"])
     below_df = df[df["Status"] == "BELOW"].drop(columns=["Status"])
+
+    if not df.empty and (df["Session"] != "Live").any():
+        st.info(
+            "⏸️ Market appears closed for one or more symbols — those rows show "
+            "the **last completed session's** close vs. VWAP/EMA8 instead of a live price."
+        )
 
     col1, col2 = st.columns(2)
     with col1:
