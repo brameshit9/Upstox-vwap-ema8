@@ -42,6 +42,7 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -503,14 +504,30 @@ def main():
         symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
         run = st.button("🔍 Run Screener", type="primary", use_container_width=True)
 
+        st.divider()
+        st.subheader("⏱️ Auto-Refresh")
+        auto_refresh = st.checkbox("Enable auto-refresh", value=False)
+        refresh_secs = st.number_input(
+            "Refresh interval (seconds)",
+            min_value=5, max_value=3600, value=60, step=5,
+            disabled=not auto_refresh,
+        )
+        if auto_refresh:
+            st_autorefresh(interval=refresh_secs * 1000, key="autorefresh_timer")
+            st.caption(f"Auto-refreshing every {refresh_secs}s.")
+
     if "results" not in st.session_state:
         st.session_state["results"] = pd.DataFrame()
     if "has_run" not in st.session_state:
         st.session_state["has_run"] = False
 
-    if run:
+    if run or auto_refresh:
         st.session_state["results"] = screen_stocks(symbols, token)
         st.session_state["has_run"] = True
+        st.session_state["last_updated"] = datetime.now().strftime("%H:%M:%S")
+
+    if st.session_state.get("last_updated"):
+        st.caption(f"🕒 Last updated: {st.session_state['last_updated']}")
 
     df = st.session_state["results"]
 
