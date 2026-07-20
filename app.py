@@ -33,15 +33,14 @@ Setup
 4. streamlit run app.py
 """
 
-import io
 import time
-import gzip
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -64,8 +63,8 @@ WATCHLIST = [
 # NOTE: "TMPV" in the original list looks like a typo for TATAMOTORS -
 # change it back if you meant a different symbol.
 
-UPSTOX_BASE = "https://api.upstox.com/v2"
-INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+UPSTOX_V2 = "https://api.upstox.com/v2"
+UPSTOX_V3 = "https://api.upstox.com/v3"
 EMA_PERIOD = 8
 
 
@@ -95,30 +94,51 @@ def auth_headers(token: str) -> dict:
 
 
 # --------------------------------------------------------------------------
-# INSTRUMENT MASTER  (symbol -> instrument_key)
+# INSTRUMENT LOOKUP  (symbol -> instrument_key)
+#
+# Uses Upstox's authenticated Instrument Search API instead of downloading
+# the static NSE.csv.gz file — that file has been reported blank/stale for
+# some accounts, and Upstox is deprecating the CSV format in favour of this
+# search endpoint. https://api.upstox.com/v2/instruments/search
 # --------------------------------------------------------------------------
 
-@st.cache_data(ttl=24 * 3600, show_spinner="Downloading NSE instrument master...")
-def load_instrument_master() -> pd.DataFrame:
-    resp = requests.get(INSTRUMENTS_URL, timeout=30)
-    resp.raise_for_status()
-    with gzip.open(io.BytesIO(resp.content)) as f:
-        df = pd.read_csv(f)
-    # Keep only NSE cash-market equities
-    df = df[(df["exchange"] == "NSE_EQ") | (df["segment"] == "NSE_EQ")]
-    return df
+def _search_instrument(symbol: str, token: str) -> str | None:
+    url = f"{UPSTOX_V2}/instruments/search"
+    params = {"query": symbol, "exchanges": "NSE", "segments": "EQ", "records": 10}
+    r = requests.get(url, headers=auth_headers(token), params=params, timeout=15)
+    r.raise_for_status()
+    results = r.json().get("data", [])
+    if not results:
+        return None
+    # Prefer an exact trading_symbol match on NSE cash-market equity
+    for item in results:
+        if item.get("trading_symbol", "").upper() == symbol.upper() and item.get("exchange") == "NSE":
+            return item.get("instrument_key")
+    # Fall back to the first NSE EQ result
+    for item in results:
+        if item.get("exchange") == "NSE" and item.get("instrument_type") == "EQ":
+            return item.get("instrument_key")
+    return results[0].get("instrument_key")
 
 
-def resolve_instrument_keys(symbols: list[str]) -> dict:
-    df = load_instrument_master()
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_search(symbol: str, _token: str, cache_bust: str) -> str | None:
+    # `_token` is excluded from Streamlit's cache key (leading underscore);
+    # `cache_bust` (today's date) naturally expires the cache each day since
+    # Upstox tokens/instrument sets refresh daily anyway.
+    try:
+        return _search_instrument(symbol, _token)
+    except requests.HTTPError:
+        return None
+
+
+def resolve_instrument_keys(symbols: list[str], token: str) -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
     mapping = {}
     for sym in symbols:
-        row = df[df["tradingsymbol"] == sym]
-        if row.empty:
-            # some symbols have a "-EQ" suffix variant in the master file
-            row = df[df["tradingsymbol"] == f"{sym}-EQ"]
-        if not row.empty:
-            mapping[sym] = row.iloc[0]["instrument_key"]
+        key = _cached_search(sym, token, today)
+        if key:
+            mapping[sym] = key
     return mapping
 
 
@@ -126,12 +146,7 @@ def resolve_instrument_keys(symbols: list[str]) -> dict:
 # DATA FETCH
 # --------------------------------------------------------------------------
 
-def fetch_intraday_1min(instrument_key: str, token: str) -> pd.DataFrame:
-    """Today's 1-minute candles, used to compute running VWAP."""
-    url = f"{UPSTOX_BASE}/historical-candle/intraday/{instrument_key}/1minute"
-    r = requests.get(url, headers=auth_headers(token), timeout=15)
-    r.raise_for_status()
-    candles = r.json().get("data", {}).get("candles", [])
+def _candles_to_df(candles: list) -> pd.DataFrame:
     if not candles:
         return pd.DataFrame()
     cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
@@ -139,38 +154,28 @@ def fetch_intraday_1min(instrument_key: str, token: str) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
+
+
+def fetch_intraday_1min(instrument_key: str, token: str) -> pd.DataFrame:
+    """Today's 1-minute candles, used to compute running VWAP."""
+    key = quote(instrument_key, safe="")
+    url = f"{UPSTOX_V3}/historical-candle/intraday/{key}/minutes/1"
+    r = requests.get(url, headers=auth_headers(token), timeout=15)
+    r.raise_for_status()
+    candles = r.json().get("data", {}).get("candles", [])
+    return _candles_to_df(candles)
 
 
 def fetch_daily_candles(instrument_key: str, token: str, lookback_days: int = 40) -> pd.DataFrame:
     """Recent daily candles, used to compute EMA(8)."""
+    key = quote(instrument_key, safe="")
     to_date = datetime.now().strftime("%Y-%m-%d")
     from_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    url = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/day/{to_date}/{from_date}"
+    url = f"{UPSTOX_V3}/historical-candle/{key}/days/1/{to_date}/{from_date}"
     r = requests.get(url, headers=auth_headers(token), timeout=15)
     r.raise_for_status()
     candles = r.json().get("data", {}).get("candles", [])
-    if not candles:
-        return pd.DataFrame()
-    cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
-    df = pd.DataFrame(candles, columns=cols)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    return df
-
-
-def fetch_ltp(instrument_keys: list[str], token: str) -> dict:
-    """Batch LTP fetch. instrument_keys must be url-encoded / comma joined."""
-    prices = {}
-    chunk_size = 200  # Upstox allows batching; keep chunks safe
-    for i in range(0, len(instrument_keys), chunk_size):
-        chunk = instrument_keys[i:i + chunk_size]
-        url = f"{UPSTOX_BASE}/market-quote/ltp"
-        r = requests.get(url, headers=auth_headers(token), params={"instrument_key": ",".join(chunk)}, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        for _, v in data.items():
-            prices[v["instrument_token"]] = v["last_price"]
-    return prices
+    return _candles_to_df(candles)
 
 
 # --------------------------------------------------------------------------
@@ -202,7 +207,7 @@ def compute_ema8(daily_df: pd.DataFrame, current_price: float) -> float:
 # --------------------------------------------------------------------------
 
 def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
-    key_map = resolve_instrument_keys(symbols)
+    key_map = resolve_instrument_keys(symbols, token)
     rows = []
     progress = st.progress(0.0, text="Screening...")
     n = len(symbols)
