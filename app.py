@@ -33,6 +33,9 @@ Setup
 4. streamlit run app.py
 """
 
+import io
+import gzip
+import json
 import time
 import requests
 import numpy as np
@@ -65,6 +68,7 @@ WATCHLIST = [
 
 UPSTOX_V2 = "https://api.upstox.com/v2"
 UPSTOX_V3 = "https://api.upstox.com/v3"
+NSE_INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 EMA_PERIOD = 8
 
 
@@ -96,10 +100,17 @@ def auth_headers(token: str) -> dict:
 # --------------------------------------------------------------------------
 # INSTRUMENT LOOKUP  (symbol -> instrument_key)
 #
-# Uses Upstox's authenticated Instrument Search API instead of downloading
-# the static NSE.csv.gz file — that file has been reported blank/stale for
-# some accounts, and Upstox is deprecating the CSV format in favour of this
-# search endpoint. https://api.upstox.com/v2/instruments/search
+# Primary path: Upstox's authenticated Instrument Search API
+# (GET /v2/instruments/search). Some Upstox token types (e.g. Analytics
+# Tokens) are documented as supporting this endpoint but in practice get
+# rejected with 401 / UDAPI100050 on it specifically, even while working
+# fine on candle/quote endpoints — this is a known Upstox-side quirk, not
+# necessarily an expired token. See:
+# community.upstox.com/t/upstox-analytics-token-works-for-historical-candles-but-returns-udapi100050-on-instrument-search
+#
+# Fallback path: Upstox's public NSE.json.gz instrument file. It needs no
+# auth at all, so it sidesteps the quirk above entirely. We try the search
+# API first (fast, always fresh) and only fall back per-symbol if it fails.
 # --------------------------------------------------------------------------
 
 def _search_instrument(symbol: str, token: str) -> str | None:
@@ -121,12 +132,26 @@ def _search_instrument(symbol: str, token: str) -> str | None:
     return results[0].get("instrument_key")
 
 
+def _upstox_error_detail(resp) -> str:
+    """Pull Upstox's own errorCode/message out of a failed response body,
+    e.g. {"errors":[{"errorCode":"UDAPI100050","message":"Invalid token..."}]}"""
+    try:
+        body = resp.json()
+        errs = body.get("errors") or []
+        if errs:
+            code = errs[0].get("errorCode", "")
+            msg = errs[0].get("message", "")
+            return f" [{code}: {msg}]" if code or msg else ""
+    except Exception:
+        pass
+    return ""
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_search(symbol: str, _token: str, cache_bust: str):
     """Returns (instrument_key_or_None, error_message_or_None).
     `_token` is excluded from Streamlit's cache key (leading underscore);
-    `cache_bust` (today's date) naturally expires the cache each day since
-    Upstox tokens/instrument sets refresh daily anyway."""
+    `cache_bust` (today's date) naturally expires the cache each day."""
     try:
         key = _search_instrument(symbol, _token)
         if key:
@@ -134,30 +159,68 @@ def _cached_search(symbol: str, _token: str, cache_bust: str):
         return None, "no matching NSE equity instrument found"
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
-        if status == 401:
-            return None, "401 Unauthorized — access token is invalid or expired"
-        return None, f"HTTP {status} error"
+        detail = _upstox_error_detail(e.response) if e.response is not None else ""
+        return None, f"Search API HTTP {status}{detail}"
     except requests.RequestException as e:
         return None, f"network error ({e})"
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner="Downloading public NSE instrument list (fallback)...")
+def _load_nse_instrument_file() -> dict:
+    """symbol (upper) -> instrument_key, built from Upstox's public,
+    unauthenticated NSE.json.gz file. Used only as a fallback."""
+    r = requests.get(NSE_INSTRUMENTS_JSON_URL, timeout=30)
+    r.raise_for_status()
+    with gzip.open(io.BytesIO(r.content)) as f:
+        data = json.load(f)
+    mapping = {}
+    for item in data:
+        if item.get("segment") == "NSE_EQ" and item.get("exchange") == "NSE":
+            sym = (item.get("trading_symbol") or "").upper()
+            if sym:
+                mapping[sym] = item.get("instrument_key")
+    return mapping
+
+
 def resolve_instrument_keys(symbols: list[str], token: str):
-    """Returns (mapping, errors). Fails fast on the first request if it's a
-    401, since that means every subsequent symbol will fail the same way."""
+    """Returns (mapping, errors, used_fallback).
+    Tries the authenticated Search API per symbol first. Any symbol that
+    fails there is retried against the public instrument file, so a
+    search-API-only quirk (auth or otherwise) doesn't take down the whole
+    screener."""
     today = datetime.now().strftime("%Y-%m-%d")
     mapping, errors = {}, []
+    search_dead = False  # once the search API fails once, don't keep hammering it
 
     for sym in symbols:
+        if search_dead:
+            continue
         key, err = _cached_search(sym, token, today)
         if key:
             mapping[sym] = key
         elif err:
             errors.append(f"{sym}: {err}")
-            if "401" in err:
-                # Token is dead for every remaining symbol too — stop burning calls.
-                break
+            search_dead = True  # same failure mode will repeat for every symbol
 
-    return mapping, errors
+    unresolved = [s for s in symbols if s not in mapping]
+    used_fallback = False
+    if unresolved:
+        try:
+            file_map = _load_nse_instrument_file()
+            still_missing = []
+            for sym in unresolved:
+                key = file_map.get(sym.upper()) or file_map.get(f"{sym.upper()}-EQ")
+                if key:
+                    mapping[sym] = key
+                    used_fallback = True
+                else:
+                    still_missing.append(sym)
+            if still_missing:
+                errors.append(f"Not found in fallback file either: {', '.join(still_missing)}")
+        except Exception as e:
+            errors.append(f"Fallback instrument file also failed: {e}")
+
+    return mapping, errors, used_fallback
 
 
 # --------------------------------------------------------------------------
@@ -258,23 +321,25 @@ def compute_ema8(daily_df: pd.DataFrame, current_price: float) -> float:
 # --------------------------------------------------------------------------
 
 def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
-    key_map, resolve_errors = resolve_instrument_keys(symbols, token)
+    key_map, resolve_errors, used_fallback = resolve_instrument_keys(symbols, token)
 
+    if used_fallback:
+        st.info(
+            "ℹ️ Upstox's Instrument Search API rejected one or more requests, so those "
+            "symbols were resolved through Upstox's **public, unauthenticated** NSE "
+            "instrument list instead. This is a known Upstox-side quirk on that specific "
+            "endpoint for some token types — it doesn't necessarily mean your token is "
+            "expired. Screening will continue normally."
+        )
     if resolve_errors:
-        auth_failed = any("401" in e for e in resolve_errors)
-        if auth_failed:
-            st.error(
-                "🔒 Upstox rejected the access token (401 Unauthorized). "
-                "Tokens expire daily — generate a fresh one at "
-                "[developer.upstox.com](https://developer.upstox.com/) and paste it in the sidebar."
-            )
-        with st.expander(f"⚠️ {len(resolve_errors)} symbol(s) could not be resolved — click for details"):
+        with st.expander(f"⚠️ {len(resolve_errors)} lookup issue(s) — click for details"):
             for e in resolve_errors:
                 st.write("•", e)
 
     rows = []
     progress = st.progress(0.0, text="Screening...")
     n = len(symbols)
+    token_confirmed_dead = False
 
     for i, sym in enumerate(symbols):
         instrument_key = key_map.get(sym)
@@ -313,7 +378,18 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
                 "Session": "Live" if is_live else f"Last close ({session_date})",
             })
         except requests.HTTPError as e:
-            st.warning(f"{sym}: API error ({e})")
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code == 401 and not token_confirmed_dead:
+                token_confirmed_dead = True
+                detail = _upstox_error_detail(e.response) if e.response is not None else ""
+                st.error(
+                    f"🔒 {sym}: 401{detail} on a **market-data** endpoint (candles), not just "
+                    "the search endpoint — this does indicate the token itself is invalid/expired "
+                    "for your whole account. Generate a fresh one at "
+                    "[developer.upstox.com](https://developer.upstox.com/)."
+                )
+            else:
+                st.warning(f"{sym}: API error ({e})")
         except Exception as e:
             st.warning(f"{sym}: {e}")
 
