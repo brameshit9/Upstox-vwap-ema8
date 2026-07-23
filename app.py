@@ -12,12 +12,14 @@ For every symbol in the watchlist:
 Classification:
   BULLISH  -> price > VWAP  AND  price > EMA8   (shown in the "Above" table)
   BEARISH  -> price < VWAP  AND  price < EMA8   (shown in the "Below" table)
-  NEUTRAL  -> mixed (price above one, below the other) -> NOT shown anywhere
-              (per your requirement: only pure above-both or pure below-both)
+  NEUTRAL  -> mixed (price above one, below the other) -> shown in tables as
+              neither Above nor Below, but its chart IS still rendered below
+              (per your latest request: charts for ALL screened stocks)
 
 A TradingView-style candlestick chart (Plotly) with VWAP and EMA8 overlaid
-is shown for EVERY matching stock (no dropdown) — you can order the charts
-by signal strength (how far price has moved from VWAP/EMA8) or alphabetically.
+is shown for EVERY stock that returned usable data (no dropdown) — you can
+order the charts by signal strength (how far price has moved from
+VWAP/EMA8) or alphabetically.
 
 Setup
 -----
@@ -368,7 +370,7 @@ def screen_stocks(symbols: list[str], token: str) -> pd.DataFrame:
             elif ltp < vwap and ltp < ema8:
                 status = "BELOW"
             else:
-                status = "NEUTRAL"  # skipped from display per requirement
+                status = "NEUTRAL"  # excluded from the Above/Below tables, but still charted
 
             # Signal strength: combined % distance of price from VWAP and EMA8.
             # Larger value = price has moved further away from both lines.
@@ -454,7 +456,7 @@ def render_all_charts(rows_df: pd.DataFrame, token: str, sort_choice: str):
     """Renders one chart per row in rows_df (no dropdown), ordered either by
     signal strength (strongest move away from VWAP/EMA8 first) or alphabetically."""
     if rows_df.empty:
-        st.caption("No stocks currently meet the above/below criteria.")
+        st.caption("No stocks currently have usable chart data.")
         return
 
     if sort_choice == "Signal strength":
@@ -463,7 +465,12 @@ def render_all_charts(rows_df: pd.DataFrame, token: str, sort_choice: str):
         ordered = rows_df.sort_values("Symbol")
 
     for _, row in ordered.iterrows():
-        badge = "🟢" if row["Status"] == "ABOVE" else "🔴"
+        if row["Status"] == "ABOVE":
+            badge = "🟢"
+        elif row["Status"] == "BELOW":
+            badge = "🔴"
+        else:
+            badge = "⚪"
         st.markdown(
             f"#### {badge} {row['Symbol']}  ·  LTP {row['LTP']}  ·  "
             f"VWAP {row['VWAP']}  ·  EMA8 {row['EMA8']}  ·  {row['Session']}"
@@ -485,8 +492,9 @@ def render_all_charts(rows_df: pd.DataFrame, token: str, sort_choice: str):
 def main():
     st.title("📈 VWAP + EMA8 Screener")
     st.caption(
-        "Shows only stocks trading **fully above** VWAP & EMA8, or **fully below** "
-        "both. Mixed signals are hidden."
+        "Above/Below tables show only stocks trading **fully above** VWAP & EMA8, "
+        "or **fully below** both. Mixed (Neutral) signals are excluded from those "
+        "two tables, but every stock that returned usable data still gets a chart below."
     )
 
     token = get_access_token()
@@ -516,6 +524,17 @@ def main():
             st_autorefresh(interval=refresh_secs * 1000, key="autorefresh_timer")
             st.caption(f"Auto-refreshing every {refresh_secs}s.")
 
+        st.divider()
+        st.subheader("📊 Chart Scope")
+        chart_scope = st.radio(
+            "Which stocks get a chart?",
+            ["All screened stocks", "Only Above/Below (skip Neutral)"],
+            index=0,
+            help="'All screened stocks' charts every symbol that returned usable "
+                 "data, including Neutral ones. The other option only charts "
+                 "stocks that made the Above or Below tables.",
+        )
+
     if "results" not in st.session_state:
         st.session_state["results"] = pd.DataFrame()
     if "has_run" not in st.session_state:
@@ -536,9 +555,8 @@ def main():
             st.warning(
                 "Ran the screener but got **zero usable rows**. Common causes: "
                 "an expired/invalid access token (see any red error above), symbols "
-                "that don't match an NSE trading symbol exactly, or every stock "
-                "currently sitting in the 'mixed' zone (above one indicator, below "
-                "the other) which is hidden by design."
+                "that don't match an NSE trading symbol exactly, or no candle data "
+                "returned for any symbol."
             )
         else:
             st.info("Click **Run Screener** in the sidebar to fetch live data.")
@@ -567,14 +585,19 @@ def main():
             use_container_width=True, hide_index=True,
         )
 
-    # ---- Charts, one per stock (no dropdown) ----
+    # ---- Charts — one per stock, no dropdown ----
+    # By default this covers EVERY symbol the screener returned usable data
+    # for (Above + Below + Neutral), not just the two filtered tables above.
     st.divider()
-    st.subheader("📊 Charts")
-    valid = pd.concat([above_df, below_df], ignore_index=True)
-    valid = valid.merge(df[["Symbol", "Status"]], on="Symbol", how="left")
+    if chart_scope == "All screened stocks":
+        chart_universe = df.copy()
+    else:
+        chart_universe = df[df["Status"].isin(["ABOVE", "BELOW"])].copy()
+
+    st.subheader(f"📊 Charts ({len(chart_universe)} of {len(df)} screened stocks)")
 
     sort_choice = st.radio("Chart order", ["Signal strength", "Alphabetical"], horizontal=True)
-    render_all_charts(valid, token, sort_choice)
+    render_all_charts(chart_universe, token, sort_choice)
 
 
 if __name__ == "__main__":
