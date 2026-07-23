@@ -452,37 +452,58 @@ def build_chart(symbol: str, instrument_key: str, token: str):
     return fig, is_live, session_date
 
 
+def _sort_group(group_df: pd.DataFrame, sort_choice: str) -> pd.DataFrame:
+    if sort_choice == "Signal strength":
+        return group_df.sort_values("Strength", ascending=False)
+    return group_df.sort_values("Symbol")
+
+
+def _render_chart_row(row: dict, token: str, badge: str):
+    st.markdown(
+        f"#### {badge} {row['Symbol']}  ·  LTP {row['LTP']}  ·  "
+        f"VWAP {row['VWAP']}  ·  EMA8 {row['EMA8']}  ·  {row['Session']}"
+    )
+    fig, is_live, session_date = build_chart(row["Symbol"], row["Instrument Key"], token)
+    if fig is None:
+        st.info(f"No recent intraday data available for {row['Symbol']}.")
+        return
+    st.plotly_chart(fig, use_container_width=True, key=f"chart_{row['Symbol']}")
+    if not is_live:
+        st.caption(f"⏸️ Market is currently closed — showing the last completed session ({session_date}).")
+    st.divider()
+
+
 def render_all_charts(rows_df: pd.DataFrame, token: str, sort_choice: str):
-    """Renders one chart per row in rows_df (no dropdown), ordered either by
-    signal strength (strongest move away from VWAP/EMA8 first) or alphabetically."""
+    """Renders charts in three ordered sections, in this fixed order:
+      1) ABOVE  (price above both VWAP & EMA8)
+      2) BELOW  (price below both VWAP & EMA8)
+      3) NEUTRAL (mixed signal)
+    Within each section, charts are ordered either by signal strength
+    (strongest move away from VWAP/EMA8 first) or alphabetically, per
+    the sort_choice control. Sections with no matching stocks are skipped
+    (no empty header shown)."""
     if rows_df.empty:
         st.caption("No stocks currently have usable chart data.")
         return
 
-    if sort_choice == "Signal strength":
-        ordered = rows_df.sort_values("Strength", ascending=False)
-    else:
-        ordered = rows_df.sort_values("Symbol")
+    sections = [
+        ("ABOVE", "🟢 Price ABOVE VWAP & EMA8", "🟢"),
+        ("BELOW", "🔴 Price BELOW VWAP & EMA8", "🔴"),
+        ("NEUTRAL", "⚪ Neutral (mixed signal)", "⚪"),
+    ]
 
-    for _, row in ordered.iterrows():
-        if row["Status"] == "ABOVE":
-            badge = "🟢"
-        elif row["Status"] == "BELOW":
-            badge = "🔴"
-        else:
-            badge = "⚪"
-        st.markdown(
-            f"#### {badge} {row['Symbol']}  ·  LTP {row['LTP']}  ·  "
-            f"VWAP {row['VWAP']}  ·  EMA8 {row['EMA8']}  ·  {row['Session']}"
-        )
-        fig, is_live, session_date = build_chart(row["Symbol"], row["Instrument Key"], token)
-        if fig is None:
-            st.info(f"No recent intraday data available for {row['Symbol']}.")
+    any_rendered = False
+    for status_value, section_title, badge in sections:
+        group = rows_df[rows_df["Status"] == status_value]
+        if group.empty:
             continue
-        st.plotly_chart(fig, use_container_width=True, key=f"chart_{row['Symbol']}")
-        if not is_live:
-            st.caption(f"⏸️ Market is currently closed — showing the last completed session ({session_date}).")
-        st.divider()
+        any_rendered = True
+        st.markdown(f"### {section_title} ({len(group)})")
+        for _, row in _sort_group(group, sort_choice).iterrows():
+            _render_chart_row(row, token, badge)
+
+    if not any_rendered:
+        st.caption("No stocks currently have usable chart data.")
 
 
 # --------------------------------------------------------------------------
